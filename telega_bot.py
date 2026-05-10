@@ -144,76 +144,69 @@ def _match_external_id(ids: list, target: str) -> bool:
 
 
 def _lookup_is_telega_user(user_id: int) -> Optional[bool]:
-    """
-    Проверить пользователя через OK.ru API.
-    Возвращает: True — использует Telega, False — нет, None — ошибка.
-    """
     if user_id <= 0:
         return None
 
     try:
-        # Шаг 1: Авторизация для получения session_key
-        auth_json = _post_json(
+        logger.info(f"🔍 Запрос session_key для user_id={user_id}")
+        
+        auth_payload = {
+            "application_key": CALLS_API_KEY,
+            "session_data": SESSION_DATA
+        }
+        
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "Telegram/8.0 (Android 13; Mobile)",
+            "Accept": "application/json",
+            "X-Requested-With": "XMLHttpRequest"
+        }
+
+        # 1. Получаем session_key
+        resp = requests.post(
             f"{CALLS_BASE_URL}/api/auth/anonymLogin",
-            {
-                "application_key": CALLS_API_KEY,
-                "session_data": SESSION_DATA
-            }
+            json=auth_payload,
+            headers=headers,
+            timeout=10
         )
+        
+        logger.info(f"📥 Auth API [{resp.status_code}]: {resp.text[:400]}")
+        resp.raise_for_status()
+        auth_json = resp.json()
+        
         session_key = _extract_session_key(auth_json)
         if not session_key:
-            logger.warning(f"Failed to get session_key for user {user_id}")
+            logger.warning(f"❌ session_key отсутствует. Ответ: {auth_json}")
             return None
 
-        # Шаг 2: Проверка ID через внешний метод
+        # 2. Проверяем ID
         payload = {
             "application_key": CALLS_API_KEY,
             "session_key": session_key,
             "externalIds": f'[{{"id":"{user_id}","ok_anonym":false}}]'
         }
-        res_json = _post_json(
+        
+        resp2 = requests.post(
             f"{CALLS_BASE_URL}/api/vchat/getOkIdsByExternalIds",
-            payload
+            json=payload,
+            headers=headers,
+            timeout=10
         )
+        
+        logger.info(f"📥 Lookup API [{resp2.status_code}]: {resp2.text[:400]}")
+        resp2.raise_for_status()
+        res_json = resp2.json()
         
         ids = res_json.get("ids") if isinstance(res_json, dict) else []
         result = _match_external_id(ids, str(user_id))
         return result
 
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"🌐 HTTP ошибка API: {e.response.text if e.response else str(e)}")
     except Exception as e:
-        logger.error(f"Lookup error for user {user_id}: {e}")
-        return None
-
-
-def _check_user_telega(user_id: int, force: bool = False) -> Optional[bool]:
-    """
-    Проверить пользователя с учётом кэша.
-    :param force: Игнорировать кэш и проверить заново
-    """
-    if not force:
-        cached = _cache_get(user_id)
-        if cached is not None:
-            logger.info(f"Cache hit for user {user_id}: {cached}")
-            with stats_lock:
-                stats["checked"] += 1
-            return cached
-
-    # Проверка через API
-    result = _lookup_is_telega_user(user_id)
-    
-    if result is not None:
-        _cache_set(user_id, result)
-        with stats_lock:
-            stats["checked"] += 1
-            if result:
-                stats["telega_found"] += 1
-        logger.info(f"Checked user {user_id}: {'Telega' if result else 'Clean'}")
-    else:
-        with stats_lock:
-            stats["errors"] += 1
-        logger.warning(f"Check failed for user {user_id}")
-    
-    return result
+        logger.error(f"💥 Ошибка проверки пользователя {user_id}: {e}", exc_info=True)
+        
+    return None
 
 
 def _update_stats(key: str, increment: int = 1):
