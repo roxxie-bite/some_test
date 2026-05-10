@@ -45,7 +45,7 @@ BAN_AFTER_WARNING = False     # Банить после предупрежден
 # Настройки API (из оригинального плагина)
 CALLS_BASE_URL = "https://calls.okcdn.ru"
 CALLS_API_KEY = "CHKIPMKGDIHBABABA"
-SESSION_DATA = '{"device_id":"telega_bot","version":2,"client_version":"bot_1","client_type":"SDK_BOT"}'
+ESSION_DATA = '{"device_id":"telega_bot","version":2,"client_version":"bot_1","client_type":"SDK_BOT"}'
 
 # Кэширование
 LOOKUP_CACHE_TTL = 6 * 60 * 60  # 6 часов
@@ -149,71 +149,77 @@ def _match_external_id(ids: list, target: str) -> bool:
 
 
 def _lookup_is_telega_user(user_id: int) -> Optional[bool]:
-    """Проверить пользователя через OK.ru API"""
+    """Проверить пользователя через OK.ru API (form-urlencoded)"""
     if user_id <= 0:
         return None
 
     try:
         logger.info(f"🔍 Запрос session_key для user_id={user_id}")
         
-        auth_payload = {
+        # === ШАГ 1: Получаем session_key ===
+        # API ожидает form-urlencoded, не JSON!
+        auth_data = {
             "application_key": CALLS_API_KEY,
-            "session_data": SESSION_DATA
+            "session_data": SESSION_DATA  # Уже готовая JSON-строка
         }
         
         headers = {
-            "Content-Type": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
             "User-Agent": "Telegram/8.0 (Android 13; Mobile)",
             "Accept": "application/json",
-            "X-Requested-With": "XMLHttpRequest"
         }
 
-        # 1. Получаем session_key
         resp = requests.post(
             f"{CALLS_BASE_URL}/api/auth/anonymLogin",
-            json=auth_payload,
+            data=auth_data,  # ← data= для form-urlencoded (НЕ json=!)
             headers=headers,
             timeout=10
         )
         
         logger.info(f"📥 Auth API [{resp.status_code}]: {resp.text[:400]}")
-        resp.raise_for_status()
-        auth_json = resp.json()
         
+        if resp.status_code != 200:
+            logger.error(f"Auth failed: {resp.status_code} - {resp.text}")
+            return None
+            
+        auth_json = resp.json()
         session_key = _extract_session_key(auth_json)
+        
         if not session_key:
             logger.warning(f"❌ session_key отсутствует. Ответ: {auth_json}")
             return None
 
-        # 2. Проверяем ID
-        payload = {
+        # === ШАГ 2: Проверяем ID ===
+        lookup_data = {
             "application_key": CALLS_API_KEY,
             "session_key": session_key,
-            "externalIds": f'[{{"id":"{user_id}","ok_anonym":false}}]'
+            "externalIds": f'[{{"id":"{user_id}","ok_anonym":false}}]'  # JSON-строка внутри формы
         }
         
         resp2 = requests.post(
             f"{CALLS_BASE_URL}/api/vchat/getOkIdsByExternalIds",
-            json=payload,
+            data=lookup_data,  # ← data= для form-urlencoded
             headers=headers,
             timeout=10
         )
         
         logger.info(f"📥 Lookup API [{resp2.status_code}]: {resp2.text[:400]}")
-        resp2.raise_for_status()
-        res_json = resp2.json()
         
+        if resp2.status_code != 200:
+            logger.error(f"Lookup failed: {resp2.status_code} - {resp2.text}")
+            return None
+            
+        res_json = resp2.json()
         ids = res_json.get("ids") if isinstance(res_json, dict) else []
         result = _match_external_id(ids, str(user_id))
         return result
 
-    except requests.exceptions.HTTPError as e:
-        logger.error(f"🌐 HTTP ошибка API: {e.response.text if e.response else str(e)}")
+    except requests.exceptions.RequestException as e:
+        logger.error(f"🌐 Network error: {e}")
     except Exception as e:
         logger.error(f"💥 Ошибка проверки пользователя {user_id}: {e}", exc_info=True)
         
     return None
-
 
 def _check_user_telega(user_id: int, force: bool = False) -> Optional[bool]:
     """Проверить пользователя с учётом кэша"""
