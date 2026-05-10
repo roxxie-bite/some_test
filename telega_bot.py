@@ -10,6 +10,7 @@ import os
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List
 
+
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatMemberAdministrator
 )
@@ -22,6 +23,15 @@ from telegram.ext import (
     filters,
 )
 
+import os
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+class DummyHandler(BaseHTTPRequestHandler):
+    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"OK")
+
+port = int(os.getenv("PORT", 10000))
+HTTPServer(("0.0.0.0", port), DummyHandler).handle_request()
+# === Конец фикса ===
 # === КОНФИГУРАЦИЯ ===
 # Токен бота (получите у @BotFather)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
