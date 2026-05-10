@@ -1,3 +1,11 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Telega Ban Bot — автоматически проверяет новых участников группы
+и банит пользователей, использующих клиент Telega.
+
+Запуск на Render: Web Service (с health check) или Background Worker
+"""
 
 # === ИМПОРТЫ ===
 import json
@@ -9,7 +17,6 @@ import threading
 import os
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List
-
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatMemberAdministrator
@@ -23,49 +30,11 @@ from telegram.ext import (
     filters,
 )
 
-# === Фикс для Render Web Service (health check) ===
-import os
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
-
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"OK")
-    
-    def do_HEAD(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
-        self.end_headers()
-        # Не отправляем тело для HEAD
-    
-    def log_message(self, format, *args):
-        # Подавляем спам в логах от health checks
-        if "HEAD" in format or "GET /" in format:
-            return
-        logger.info(f"Health check: {format % args}")
-
-def _start_health_server():
-    port = int(os.getenv("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    logger.info(f"🩺 Health server started on port {port}")
-    server.serve_forever()  # Работает постоянно в фоне
-
-# Запускаем сервер здоровья в отдельном потоке
-health_thread = threading.Thread(target=_start_health_server, daemon=True)
-health_thread.start()
-# === Конец фикса ===
-
-# Запуск бота (основной поток)
-logger.info("🤖 Starting Telega Ban Bot...")
-app.run_polling(drop_pending_updates=True)
 # === КОНФИГУРАЦИЯ ===
-# Токен бота (получите у @BotFather)
+# Токен бота (обязательно укажите в переменных окружения Render: BOT_TOKEN)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# ID администраторов, которым доступны команды управления
+# ID администраторов (через запятую в ADMIN_IDS или по умолчанию ваш ID)
 ADMIN_USER_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "2135550613").split(",") if x.isdigit()]
 
 # Настройки поведения
@@ -120,7 +89,6 @@ def _cache_get(user_id: int) -> Optional[bool]:
             return None
         ts = payload.get("checked_at", 0)
         if _now_ts() - ts > LOOKUP_CACHE_TTL:
-            # Удаляем просроченную запись
             lookup_cache.pop(key, None)
             return None
         return payload.get("value")
@@ -133,15 +101,13 @@ def _cache_set(user_id: int, value: bool):
             "value": bool(value),
             "checked_at": _now_ts()
         }
-        # Ограничиваем размер кэша (последние 1000 записей)
         if len(lookup_cache) > 1000:
-            # Удаляем самые старые
             items = sorted(lookup_cache.items(), key=lambda x: x[1].get("checked_at", 0))
             for key, _ in items[:len(items) - 1000]:
                 lookup_cache.pop(key, None)
 
 
-def _post_json(url: str, data: dict) -> dict:
+def _post_json(url: str,  dict) -> dict:
     """Отправить POST-запрос с JSON"""
     try:
         resp = requests.post(
@@ -183,6 +149,7 @@ def _match_external_id(ids: list, target: str) -> bool:
 
 
 def _lookup_is_telega_user(user_id: int) -> Optional[bool]:
+    """Проверить пользователя через OK.ru API"""
     if user_id <= 0:
         return None
 
@@ -248,6 +215,33 @@ def _lookup_is_telega_user(user_id: int) -> Optional[bool]:
     return None
 
 
+def _check_user_telega(user_id: int, force: bool = False) -> Optional[bool]:
+    """Проверить пользователя с учётом кэша"""
+    if not force:
+        cached = _cache_get(user_id)
+        if cached is not None:
+            logger.info(f"Cache hit for user {user_id}: {cached}")
+            with stats_lock:
+                stats["checked"] += 1
+            return cached
+
+    result = _lookup_is_telega_user(user_id)
+    
+    if result is not None:
+        _cache_set(user_id, result)
+        with stats_lock:
+            stats["checked"] += 1
+            if result:
+                stats["telega_found"] += 1
+        logger.info(f"Checked user {user_id}: {'Telega' if result else 'Clean'}")
+    else:
+        with stats_lock:
+            stats["errors"] += 1
+        logger.warning(f"Check failed for user {user_id}")
+    
+    return result
+
+
 def _update_stats(key: str, increment: int = 1):
     """Обновить статистику"""
     with stats_lock:
@@ -307,13 +301,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Проверка пользователя: /check <id|username> [--force]
-    """
+    """Проверка пользователя: /check <id|username> [--force]"""
     user = update.effective_user
     chat = update.effective_chat
     
-    # Проверка прав для небезопасных действий
     is_admin = user.id in ADMIN_USER_IDS
     if chat and not is_admin:
         try:
@@ -322,18 +313,15 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
     
-    # Парсинг аргументов
     args = context.args or []
     force_check = "--force" in args
     args = [a for a in args if a != "--force"]
     
-    # Определение целевого пользователя
     target_user = None
     user_id = None
     username = None
     
     if not args:
-        # Если команда в ответ на сообщение — берём автора
         if update.message and update.message.reply_to_message:
             target_user = update.message.reply_to_message.from_user
             user_id = target_user.id
@@ -343,8 +331,7 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "❌ <b>Использование:</b>\n"
                 "• /check &lt;user_id&gt; — проверить по ID\n"
                 "• /check @username — проверить по юзернейму (в группе)\n"
-                "• /check &lt;id&gt; --force — проверить, игнорируя кэш\n"
-                "• Ответьте на сообщение и напишите /check",
+                "• /check &lt;id&gt; --force — проверить, игнорируя кэш",
                 parse_mode="HTML"
             )
             return
@@ -352,11 +339,8 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target = args[0]
         
         if target.startswith("@"):
-            # Поиск по юзернейму (только в группе)
             if not chat:
-                await update.message.reply_text(
-                    "❌ Поиск по @username работает только в группах"
-                )
+                await update.message.reply_text("❌ Поиск по @username работает только в группах")
                 return
             try:
                 chat_member = await context.bot.get_chat_member(chat.id, target)
@@ -364,79 +348,48 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 user_id = target_user.id
                 username = target_user.username
             except Exception as e:
-                await update.message.reply_text(
-                    f"❌ Не удалось найти пользователя {target}:\n<code>{e}</code>",
-                    parse_mode="HTML"
-                )
+                await update.message.reply_text(f"❌ Не удалось найти пользователя {target}:\n<code>{e}</code>", parse_mode="HTML")
                 return
         elif target.isdigit():
             user_id = int(target)
             username = None
         else:
-            await update.message.reply_text(
-                "❌ Укажите корректный ID (число) или @username"
-            )
+            await update.message.reply_text("❌ Укажите корректный ID (число) или @username")
             return
     
-    # Отправляем статус
     target_display = f"<code>{user_id}</code>"
     if username:
         target_display += f" (@{username})"
     if target_user and target_user.first_name:
         target_display = f"{target_user.mention_html()} {target_display}"
     
-    status_msg = await update.message.reply_text(
-        f"🔍 Проверяю пользователя {target_display}...",
-        parse_mode="HTML"
-    )
+    status_msg = await update.message.reply_text(f"🔍 Проверяю пользователя {target_display}...", parse_mode="HTML")
     
-    # Выполняем проверку
     is_telega = _check_user_telega(user_id, force=force_check)
     
-    # Формируем ответ
     if is_telega is None:
         await status_msg.edit_text(
             f"⚠️ Не удалось проверить пользователя {target_display}\n\n"
-            f"Возможные причины:\n"
-            f"• API временно недоступен\n"
-            f"• Пользователь не найден в базе проверок\n"
-            f"• Превышен лимит запросов — попробуйте позже",
+            f"Возможные причины:\n• API временно недоступен\n• Пользователь не найден в базе проверок",
             parse_mode="HTML"
         )
-        
     elif is_telega:
         response_text = (
             f"🚨 <b>Обнаружено!</b>\n"
             f"Пользователь {target_display} использует клиент <b>Telega</b>.\n\n"
-            f"<b>Почему это опасно:</b>\n"
-            f"• Ваши данные могут передаваться третьим лицам\n"
-            f"• Аккаунт может быть скомпрометирован\n"
-            f"• Возможна кража сессии и переписка от вашего имени\n\n"
             f"<b>Рекомендации:</b>\n"
             f"• Удалить приложение Telega\n"
-            f"• Завершить сессию в Настройки → Устройства → Завершить сеанс Telega\n"
-            f"• Установить официальный клиент: telegram.org"
+            f"• Завершить сессию в настройках аккаунта"
         )
         
-        # Кнопка бана для админов
         keyboard = None
         if chat and is_admin:
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔨 Забанить", callback_data=f"ban_{user_id}")]
-            ])
-            response_text += "\n\n👆 Нажмите кнопку, чтобы заблокировать пользователя"
+            keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔨 Забанить", callback_data=f"ban_{user_id}")]])
+            response_text += "\n\n👆 Нажмите кнопку, чтобы заблокировать"
         
-        await status_msg.edit_text(
-            response_text,
-            parse_mode="HTML",
-            reply_markup=keyboard
-        )
-        
+        await status_msg.edit_text(response_text, parse_mode="HTML", reply_markup=keyboard)
     else:
-        await status_msg.edit_text(
-            f"✅ Пользователь {target_display} <b>чист</b> — не использует Telega",
-            parse_mode="HTML"
-        )
+        await status_msg.edit_text(f"✅ Пользователь {target_display} <b>чист</b> — не использует Telega", parse_mode="HTML")
 
 
 async def checkme_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -447,34 +400,19 @@ async def checkme_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_telega = _check_user_telega(user.id)
     
     if is_telega is None:
-        await update.message.reply_text(
-            "⚠️ Не удалось выполнить проверку. Попробуйте позже."
-        )
+        await update.message.reply_text("⚠️ Не удалось выполнить проверку. Попробуйте позже.")
     elif is_telega:
         await update.message.reply_text(
-            "🚨 <b>Внимание!</b>\n"
-            "Вы используете клиент <b>Telega</b>.\n\n"
-            "Это может быть небезопасно:\n"
-            "• Ваши данные могут передаваться третьим лицам\n"
-            "• Аккаунт может быть скомпрометирован\n"
-            "• Возможна кража сессии и переписка от вашего имени\n\n"
-            "Рекомендуем перейти на официальный клиент Telegram:\n"
-            "👉 telegram.org",
+            "🚨 <b>Внимание!</b>\nВы используете клиент <b>Telega</b>.\n\n"
+            "Рекомендуем перейти на официальный клиент: telegram.org",
             parse_mode="HTML"
         )
     else:
-        await update.message.reply_text(
-            "✅ Вы используете безопасный клиент. Всё в порядке! 🎉"
-        )
+        await update.message.reply_text("✅ Вы используете безопасный клиент. Всё в порядке! 🎉")
 
 
 async def cache_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Управление кэшем:
-    /cache list — показать записи
-    /cache clear — очистить кэш
-    /cache delete <id> — удалить запись по ID
-    """
+    """Управление кэшем (только админы)"""
     user = update.effective_user
     if user.id not in ADMIN_USER_IDS:
         await update.message.reply_text("❌ Эта команда доступна только администраторам")
@@ -488,65 +426,46 @@ async def cache_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             count = len(lookup_cache)
             lookup_cache.clear()
         await update.message.reply_text(f"🗑️ Кэш очищен. Удалено записей: {count}")
-        logger.info(f"Cache cleared by admin {user.id}")
-        
     elif action == "delete" and len(args) > 1 and args[1].isdigit():
         uid = args[1]
         with cache_lock:
             if uid in lookup_cache:
                 del lookup_cache[uid]
-                await update.message.reply_text(f"🗑️ Запись для пользователя {uid} удалена")
+                await update.message.reply_text(f"🗑️ Запись для {uid} удалена")
             else:
-                await update.message.reply_text(f"ℹ️ Запись для пользователя {uid} не найдена в кэше")
-                
+                await update.message.reply_text(f"ℹ️ Запись для {uid} не найдена")
     elif action == "list":
         with cache_lock:
             total = len(lookup_cache)
             if total == 0:
                 await update.message.reply_text("📭 Кэш пуст")
                 return
-            
-            # Показываем последние 15 записей
             items = list(lookup_cache.items())[-15:]
-            lines = [f"📋 Кэш ({total} записей, последние 15):\n"]
+            lines = [f"📋 Кэш ({total} записей):\n"]
             for uid, data in reversed(items):
                 status = "🚨 Telega" if data.get("value") else "✅ Clean"
-                checked = data.get("checked_at", 0)
-                ago = _now_ts() - checked
+                ago = _now_ts() - data.get("checked_at", 0)
                 time_str = f"{ago//60}м" if ago < 3600 else f"{ago//3600}ч"
                 lines.append(f"• <code>{uid}</code>: {status} ({time_str} назад)")
-        
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
-        
     else:
         await update.message.reply_text(
-            "❌ <b>Использование:</b>\n"
-            "• /cache list — показать записи\n"
-            "• /cache clear — очистить кэш\n"
-            "• /cache delete &lt;id&gt; — удалить запись",
+            "❌ <b>Использование:</b>\n• /cache list\n• /cache clear\n• /cache delete &lt;id&gt;",
             parse_mode="HTML"
         )
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показать статистику: /stats"""
+    """Показать статистику"""
     with stats_lock:
         text = (
-            f"📊 <b>Статистика Telega Ban Bot</b>\n\n"
-            f"• Проверено пользователей: {stats.get('checked', 0)}\n"
-            f"• Обнаружено Telega: {stats.get('telega_found', 0)}\n"
+            f"📊 <b>Статистика</b>\n"
+            f"• Проверено: {stats.get('checked', 0)}\n"
+            f"• Telega найдено: {stats.get('telega_found', 0)}\n"
             f"• Забанено: {stats.get('banned', 0)}\n"
-            f"• Ошибок: {stats.get('errors', 0)}\n\n"
-            f"• Записей в кэше: {len(lookup_cache)}\n"
-            f"• TTL кэша: {LOOKUP_CACHE_TTL // 3600} ч."
+            f"• Ошибок: {stats.get('errors', 0)}\n"
+            f"• В кэше: {len(lookup_cache)}"
         )
-    
-    # Если админ — показываем дополнительные данные
-    if update.effective_user.id in ADMIN_USER_IDS:
-        text += f"\n\n<b>Конфигурация:</b>\n"
-        text += f"• AUTO_BAN: {'✅ Да' if AUTO_BAN else '❌ Нет'}\n"
-        text += f"• CHECK_ON_JOIN: {'✅ Да' if CHECK_ON_JOIN else '❌ Нет'}"
-    
     await update.message.reply_text(text, parse_mode="HTML")
 
 
@@ -554,21 +473,18 @@ async def reset_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     """Сбросить статистику (только админы)"""
     if update.effective_user.id not in ADMIN_USER_IDS:
         return
-    
     with stats_lock:
         for key in stats:
             stats[key] = 0
-    
     await update.message.reply_text("🔄 Статистика сброшена")
-    logger.info(f"Stats reset by admin {update.effective_user.id}")
 
 
-# === ОБРАБОТЧИК CALLBACK (кнопки) ===
+# === CALLBACK HANDLERS ===
 
 async def ban_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик нажатия на кнопку бана"""
+    """Обработчик кнопки бана"""
     query = update.callback_query
-    await query.answer()  # Обязательно для callback
+    await query.answer()
     
     if not query.data or not query.data.startswith("ban_"):
         return
@@ -581,7 +497,6 @@ async def ban_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ Не удалось определить чат")
             return
         
-        # Проверка прав
         admin_id = query.from_user.id
         is_admin = admin_id in ADMIN_USER_IDS
         if not is_admin:
@@ -595,33 +510,20 @@ async def ban_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ Только администраторы могут банить")
             return
         
-        # Бан пользователя
         await chat.ban_member(user_id)
-        
-        # Уведомление (если бот может отправлять)
-        try:
-            await query.edit_message_text(
-                f"✅ Пользователь <code>{user_id}</code> заблокирован",
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass  # Сообщение могло быть удалено
-        
+        await query.edit_message_text(f"✅ Пользователь <code>{user_id}</code> заблокирован", parse_mode="HTML")
         _update_stats("banned")
-        logger.info(f"User {user_id} banned by {admin_id} in chat {chat.id}")
+        logger.info(f"User {user_id} banned by {admin_id}")
         
     except Exception as e:
         logger.error(f"Ban error: {e}")
-        try:
-            await query.edit_message_text(f"❌ Ошибка при блокировке: <code>{e}</code>", parse_mode="HTML")
-        except Exception:
-            pass
+        await query.edit_message_text(f"❌ Ошибка: <code>{e}</code>", parse_mode="HTML")
 
 
-# === ОБРАБОТЧИК НОВЫХ УЧАСТНИКОВ ===
+# === НОВЫЕ УЧАСТНИКИ ===
 
 async def on_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик входа новых участников в группу"""
+    """Обработчик входа новых участников"""
     if not CHECK_ON_JOIN:
         return
     
@@ -629,86 +531,42 @@ async def on_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not chat or chat.type == "private":
         return
     
-    # Проверка прав бота
     try:
         bot_member = await chat.get_member(context.bot.id)
-        if not isinstance(bot_member, ChatMemberAdministrator) or not bot_member.can_restrict_members:
-            logger.warning(f"Bot lacks ban permissions in chat {chat.id}")
+        if not bot_member.can_restrict_members:
             return
-    except Exception as e:
-        logger.error(f"Can't check bot permissions: {e}")
+    except Exception:
         return
     
-    # Получаем список новых участников
     new_members = update.effective_message.new_chat_members if update.effective_message else []
     if not new_members:
         return
     
     for user in new_members:
         if user.is_bot:
-            continue  # Пропускаем ботов
+            continue
         
         user_id = user.id
-        username = f"@{user.username}" if user.username else ""
-        logger.info(f"New member: {user_id} {username} in chat {chat.id}")
+        logger.info(f"New member: {user_id} in chat {chat.id}")
         
-        # Проверка на Telega
         is_telega = _check_user_telega(user_id)
         
         if is_telega is None:
-            # Не удалось проверить — логируем и пропускаем
-            logger.warning(f"Check failed for new member {user_id}")
             continue
         
         if is_telega:
-            # Формируем предупреждение
             mention = user.mention_html(user.first_name) if user.first_name else f"<code>{user_id}</code>"
-            warning = (
-                f"🚨 <b>Обнаружен пользователь Telega!</b>\n"
-                f"{mention} {username} использует небезопасный клиент.\n\n"
-                f"<b>Рекомендации:</b>\n"
-                f"• Удалить Telega\n"
-                f"• Завершить сессию в настройках аккаунта"
-            )
+            warning = f"🚨 <b>Telega обнаружен!</b>\n{mention} использует небезопасный клиент."
             
             if AUTO_BAN:
-                # Автоматический бан
                 try:
                     await chat.ban_member(user_id)
-                    await context.bot.send_message(
-                        chat_id=chat.id,
-                        text=f"{warning}\n\n❌ Пользователь заблокирован.",
-                        parse_mode="HTML"
-                    )
+                    await context.bot.send_message(chat_id=chat.id, text=f"{warning}\n\n❌ Заблокирован.", parse_mode="HTML")
                     _update_stats("banned")
-                    logger.info(f"Auto-banned Telega user {user_id} in chat {chat.id}")
                 except Exception as e:
-                    logger.error(f"Failed to ban user {user_id}: {e}")
-                    await context.bot.send_message(
-                        chat_id=chat.id,
-                        text=f"{warning}\n\n❌ Ошибка при блокировке: <code>{e}</code>",
-                        parse_mode="HTML"
-                    )
-            elif BAN_AFTER_WARNING:
-                # Предупреждение с кнопкой бана
-                keyboard = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔨 Забанить", callback_data=f"ban_{user_id}")]
-                ])
-                await context.bot.send_message(
-                    chat_id=chat.id,
-                    text=f"{warning}\n\n👆 Админ может нажать для блокировки",
-                    parse_mode="HTML",
-                    reply_markup=keyboard
-                )
+                    logger.error(f"Ban failed: {e}")
             else:
-                # Только предупреждение
-                await context.bot.send_message(
-                    chat_id=chat.id,
-                    text=warning,
-                    parse_mode="HTML"
-                )
-        else:
-            logger.info(f"New member {user_id} is clean")
+                await context.bot.send_message(chat_id=chat.id, text=warning, parse_mode="HTML")
 
 
 # === ОБРАБОТЧИК ОШИБОК ===
@@ -718,37 +576,59 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     error = context.error
     logger.error(f"Update {update} caused error: {error}", exc_info=error)
     
-    # Уведомляем админов о критических ошибках
     if error and ("Unauthorized" in str(error) or "Forbidden" in str(error)):
         for admin_id in ADMIN_USER_IDS:
             try:
-                await context.bot.send_message(
-                    chat_id=admin_id,
-                    text=f"❌ <b>Критическая ошибка бота:</b>\n<code>{error}</code>",
-                    parse_mode="HTML"
-                )
+                await context.bot.send_message(chat_id=admin_id, text=f"❌ Ошибка бота: <code>{error}</code>", parse_mode="HTML")
             except Exception:
                 pass
 
 
-# === ЗАПУСК БОТА ===
+# === HEALTH SERVER ДЛЯ RENDER ===
+
+def _start_health_server():
+    """Запускает HTTP-сервер для health checks Render"""
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"OK")
+        
+        def do_HEAD(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+        
+        def log_message(self, format, *args):
+            if "HEAD" in format or "GET /" in format:
+                return
+            logger.debug(f"Health: {format % args}")
+    
+    port = int(os.getenv("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    logger.info(f"🩺 Health server on port {port}")
+    server.serve_forever()
+
+
+# === MAIN ===
 
 def main():
-    """Запуск бота"""
-    # Проверка токена
-    if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        logger.error("❌ Укажите BOT_TOKEN в конфигурации или переменной окружения!")
-        print("ERROR: Please set BOT_TOKEN environment variable or edit the script")
+    """Точка входа"""
+    if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+        logger.error("❌ Укажите BOT_TOKEN в переменной окружения!")
         return
     
-    logger.info("🤖 Starting Telega Ban Bot...")
+    # Запускаем health server для Render (в фоне)
+    health_thread = threading.Thread(target=_start_health_server, daemon=True)
+    health_thread.start()
     
-    # Создаём приложение
+    logger.info("🤖 Starting Telega Ban Bot...")
     app = Application.builder().token(BOT_TOKEN).build()
     
-    # === Регистрация обработчиков ===
-    
-    # Команды
+    # Регистрируем обработчики
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("check", check_command))
@@ -756,25 +636,14 @@ def main():
     app.add_handler(CommandHandler("cache", cache_command))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("reset_stats", reset_stats_command))
-    
-    # Callback для кнопок
     app.add_handler(CallbackQueryHandler(ban_callback, pattern="^ban_"))
     
-    # Новые участники (только если включено)
     if CHECK_ON_JOIN:
-        app.add_handler(
-            MessageHandler(
-                filters.StatusUpdate.NEW_CHAT_MEMBERS & ~filters.COMMAND,
-                on_new_member
-            )
-        )
+        app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS & ~filters.COMMAND, on_new_member))
     
-    # Обработчик ошибок
     app.add_error_handler(error_handler)
     
-    # Запуск
-    logger.info("✅ Bot handlers registered. Starting polling...")
-    print(f"🤖 Telega Ban Bot запущен! (лог: telega_bot.log)")
+    logger.info("✅ Handlers registered. Starting polling...")
     app.run_polling(drop_pending_updates=True)
 
 
