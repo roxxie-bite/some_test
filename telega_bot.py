@@ -23,15 +23,44 @@ from telegram.ext import (
     filters,
 )
 
+# === Фикс для Render Web Service (health check) ===
 import os
+import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-class DummyHandler(BaseHTTPRequestHandler):
-    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b"OK")
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK")
+    
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        # Не отправляем тело для HEAD
+    
+    def log_message(self, format, *args):
+        # Подавляем спам в логах от health checks
+        if "HEAD" in format or "GET /" in format:
+            return
+        logger.info(f"Health check: {format % args}")
 
-port = int(os.getenv("PORT", 10000))
-HTTPServer(("0.0.0.0", port), DummyHandler).handle_request()
+def _start_health_server():
+    port = int(os.getenv("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    logger.info(f"🩺 Health server started on port {port}")
+    server.serve_forever()  # Работает постоянно в фоне
+
+# Запускаем сервер здоровья в отдельном потоке
+health_thread = threading.Thread(target=_start_health_server, daemon=True)
+health_thread.start()
 # === Конец фикса ===
+
+# Запуск бота (основной поток)
+logger.info("🤖 Starting Telega Ban Bot...")
+app.run_polling(drop_pending_updates=True)
 # === КОНФИГУРАЦИЯ ===
 # Токен бота (получите у @BotFather)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
