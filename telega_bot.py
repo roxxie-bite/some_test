@@ -351,6 +351,7 @@ def main():
 
     app = Application.builder().token(Config.BOT_TOKEN).build()
     
+    # Регистрируем хендлеры
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("cache", cmd_cache))
@@ -367,8 +368,25 @@ def main():
             drop_pending_updates=True
         )
     else:
-        log.info("📡 Polling mode")
-        app.run_polling(drop_pending_updates=True)
+        log.info("📡 Polling mode (with auto-conflict handling)")
+        from telegram.error import Conflict
+        import time
+        
+        # Запускаем polling с обработкой конфликтов деплоя
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                app.run_polling(drop_pending_updates=True)
+                break  # Успешный запуск
+            except Conflict:
+                wait_sec = 20 * (attempt + 1)
+                log.warning(f"⚠️ Polling conflict! Another instance is active. Retrying in {wait_sec}s... ({attempt+1}/{max_retries})")
+                time.sleep(wait_sec)
+            except Exception as e:
+                log.error(f"❌ Fatal polling error: {e}")
+                break
+        else:
+            log.error("❌ Failed to start polling after retries. Check for zombie instances.")
 
 if __name__ == "__main__":
     main()
